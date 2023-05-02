@@ -20,7 +20,7 @@ from dbimutils import smart_imread_pil, smart_24bit, make_square, smart_resize
 plugin_id = get_plugin_id()
 
 import onnxruntime
-tagger = onnxruntime.InferenceSession(os.path.join(CURRENT_DIRECTORY, ONNX_FILE),providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+tagger = onnxruntime.InferenceSession(os.path.join("wd-v1-4-vit-tagger-v2-last-pooling-layer.onnx"),providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
 
 def ui():
     with gr.Group():
@@ -31,7 +31,7 @@ def ui():
             with gr.Row():
                 pfg_scale = gr.Slider(minimum=0, maximum=3, step=0.05, label="pfg scale", value=1.0)
             with gr.Row():
-                pfg_path = gr.Dropdown(self.model_list, label="pfg model", value = None)
+                pfg_path = gr.Textbox(label="pfg model", value = None)
             with gr.Row():
                 pfg_num_tokens = gr.Slider(minimum=0, maximum=20, step=1.0, value=10.0, label="pfg num tokens")
     return [
@@ -49,7 +49,6 @@ def infer(img:Image):
     img = make_square(img, 448)
     img = smart_resize(img, 448)
     img = img.astype(np.float32)
-    print("inferencing by tensorflow model.")
     probs = self.tagger.run([self.tagger.get_outputs()[0].name],{self.tagger.get_inputs()[0].name: np.array([img])})[0]
     return torch.tensor(probs).squeeze(0).cpu()
 
