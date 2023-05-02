@@ -3,7 +3,7 @@ from typing import *
 
 import gradio as gr
 import numpy as np
-import PIL.Image
+from PIL import Image
 import torch
 
 from api.events import event_handler
@@ -15,31 +15,31 @@ from modules import config
 from modules.logger import logger
 from modules.plugin_loader import register_plugin_ui
 
-from dbimutils import smart_imread_pil, smart_24bit, make_square, smart_resize
-
+from .dbimutils import smart_imread_pil, smart_24bit, make_square, smart_resize
+import os
 plugin_id = get_plugin_id()
-
+CURRENT_DIRECTORY = "plugins/radiata-pfg-plugin/"
 import onnxruntime
-tagger = onnxruntime.InferenceSession(os.path.join("wd-v1-4-vit-tagger-v2-last-pooling-layer.onnx"),providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+tagger = onnxruntime.InferenceSession("plugins/radiata-pfg-plugin/wd-v1-4-vit-tagger-v2-last-pooling-layer.onnx",providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
 
 def ui():
+    model_list = [file for file in os.listdir(os.path.join(CURRENT_DIRECTORY, "models/")) if file != "put_models_here.txt"]
     with gr.Group():
-        with gr.Accordion("PFG", open=False):
-            enabled = gr.Checkbox(value=False, label="Enable")
-            with gr.Row():
-                image = gr.Image(type="pil", label="guide image")
-            with gr.Row():
-                pfg_scale = gr.Slider(minimum=0, maximum=3, step=0.05, label="pfg scale", value=1.0)
-            with gr.Row():
-                pfg_path = gr.Textbox(label="pfg model", value = None)
-            with gr.Row():
-                pfg_num_tokens = gr.Slider(minimum=0, maximum=20, step=1.0, value=10.0, label="pfg num tokens")
+        enabled = gr.Checkbox(value=False, label="Enable")
+        with gr.Row():
+            image = gr.Image(type="pil", label="guide image")
+        with gr.Row():
+            pfg_scale = gr.Slider(minimum=0, maximum=3, step=0.05, label="pfg scale", value=1.0)
+        with gr.Row():
+            pfg_path = gr.Dropdown(model_list, label="pfg model", value = None)
+        with gr.Row():
+            pfg_num_tokens = gr.Slider(minimum=0, maximum=20, step=1.0, value=10.0, label="pfg num tokens")
     return [
         enabled,
         image,
         pfg_scale,
         pfg_path,
-        pdf_num_tokens
+        pfg_num_tokens
     ]
 
 #wd-14-taggerの推論関数
@@ -49,7 +49,7 @@ def infer(img:Image):
     img = make_square(img, 448)
     img = smart_resize(img, 448)
     img = img.astype(np.float32)
-    probs = self.tagger.run([self.tagger.get_outputs()[0].name],{self.tagger.get_inputs()[0].name: np.array([img])})[0]
+    probs = tagger.run([tagger.get_outputs()[0].name],{tagger.get_inputs()[0].name: np.array([img])})[0]
     return torch.tensor(probs).squeeze(0).cpu()
 
 
@@ -77,10 +77,10 @@ def load_resource(e: LoadResourceEvent):
 
     hidden_state = infer(image)
 
-    pfg_weight = torch.load(os.path.join(pfg_path))
+    pfg_weight = torch.load(os.path.join(CURRENT_DIRECTORY  ,"models",pfg_path))
     weight = pfg_weight["pfg_linear.weight"].cpu() #大した計算じゃないのでcpuでいいでしょう
     bias = pfg_weight["pfg_linear.bias"].cpu()
-    pfg_feature = (weight @ pfg_hidden_state + bias) * pfg_scale
+    pfg_feature = (weight @ hidden_state + bias) * pfg_scale
     pfg_feature = pfg_feature.reshape(1, pfg_num_tokens, -1)
     e.pipe.plugin_data[plugin_id][1] = pfg_feature
 
@@ -93,11 +93,11 @@ def pre_unet_predict(e: UNetDenoisingEvent):
         _,
         pfg_num_tokens,
     ) = e.pipe.plugin_data[plugin_id]
-    if enabled or e.step > 0:
+    if not enabled or e.step > 0:
         return
     
-    
     print(f"Apply pfg")
+    
     #(batch_size*num_prompts, cond_tokens, dim)
     uncond, cond = e.prompt_embeds.chunk(2)
     #(1, num_tokens, dim)
