@@ -5,8 +5,6 @@ import gradio as gr
 import numpy as np
 import PIL.Image
 import torch
-from diffusers import ControlNetModel
-from diffusers.utils import PIL_INTERPOLATION
 
 from api.events import event_handler
 from api.events.common import PreUICreateEvent
@@ -18,204 +16,71 @@ from modules.logger import logger
 from modules.plugin_loader import register_plugin_ui
 from modules.shared import hf_diffusers_cache_dir
 
-from . import preprocessors
-
 plugin_id = get_plugin_id()
-controlnet_model: Optional[ControlNetModel] = None
-available_preprocessors = ["canny", "openpose"]
-available_controlnet_models = [
-    "lllyasviel/sd-controlnet-canny",
-    "lllyasviel/sd-controlnet-mlsd",
-    "lllyasviel/sd-controlnet-seg",
-    "lllyasviel/sd-controlnet-hed",
-    "lllyasviel/sd-controlnet-normal",
-    "lllyasviel/sd-controlnet-scribble",
-    "lllyasviel/sd-controlnet-depth",
-    "lllyasviel/sd-controlnet-openpose",
-]
 
-
-def preprocess_image(image: PIL.Image, preprocessor: str):
-    if hasattr(preprocessors, preprocessor):
-        return getattr(preprocessors, preprocessor)(image)
-    else:
-        logger.warning(f"Preprocessor {preprocessor} not found")
-        return image
-
+import onnxruntime
+tagger = onnxruntime.InferenceSession(os.path.join(CURRENT_DIRECTORY, ONNX_FILE),providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
 
 def ui():
-    with gr.Column():
-        with gr.Row():
-            image = gr.Image(label="Input Image", type="pil")
-            preview_image = gr.Image(label="Preview", interactive=False, visible=False)
-        with gr.Row():
-            enabled = gr.Checkbox(label="Enable", value=False)
-
-        with gr.Row():
-            preprocessor = gr.Dropdown(
-                label="Preprocessor",
-                choices=["none"] + available_preprocessors,
-                value="none",
-            )
-            controlnet_model_id = gr.Dropdown(
-                label="ControlNet model",
-                choices=available_controlnet_models,
-                value="lllyasviel/sd-controlnet-canny",
-            )
-        with gr.Row():
-            control_weight = gr.Slider(
-                label="Control weight",
-                minimum=0.0,
-                maximum=2.0,
-                step=0.01,
-                value=1.0,
-            )
-            start_control_step = gr.Slider(
-                label="Start control step",
-                minimum=0.0,
-                maximum=1.0,
-                step=0.01,
-                value=0.0,
-            )
-            end_control_step = gr.Slider(
-                label="End control step",
-                minimum=0.0,
-                maximum=1.0,
-                step=0.01,
-                value=1.0,
-            )
-
-        with gr.Row():
-            guess_mode = gr.Checkbox(label="Guess mode", value=False)
-        with gr.Row():
-            preview = gr.Button("Preview")
-
-    def run_preview(image, preprocessor):
-        return gr.Image.update(
-            visible=True, value=preprocess_image(image, preprocessor)
-        )
-
-    preview.click(run_preview, inputs=[image, preprocessor], outputs=[preview_image])
-
+    with gr.Group():
+        with gr.Accordion("PFG", open=False):
+            enabled = gr.Checkbox(value=False, label="Enable")
+            with gr.Row():
+                image = gr.Image(type="pil", label="guide image")
+            with gr.Row():
+                pfg_scale = gr.Slider(minimum=0, maximum=3, step=0.05, label="pfg scale", value=1.0)
+            with gr.Row():
+                pfg_path = gr.Dropdown(self.model_list, label="pfg model", value = None)
+            with gr.Row():
+                pfg_num_tokens = gr.Slider(minimum=0, maximum=20, step=1.0, value=10.0, label="pfg num tokens")
     return [
-        image,
         enabled,
-        preprocessor,
-        controlnet_model_id,
-        control_weight,
-        start_control_step,
-        end_control_step,
-        guess_mode,
+        image,
+        pfg_scale,
+        pfg_path,
+        pdf_num_tokens
     ]
+
+#wd-14-taggerの推論関数
+def infer(img:Image):
+    img = smart_imread_pil(img)
+    img = smart_24bit(img)
+    img = make_square(img, 448)
+    img = smart_resize(img, 448)
+    img = img.astype(np.float32)
+    print("inferencing by tensorflow model.")
+    probs = self.tagger.run([self.tagger.get_outputs()[0].name],{self.tagger.get_inputs()[0].name: np.array([img])})[0]
+    return torch.tensor(probs).squeeze(0).cpu()
 
 
 @event_handler()
 def pre_ui_create(e: PreUICreateEvent):
     register_plugin_ui(ui)
 
-
-def prepare_image(
-    image: PIL.Image.Image,
-    width: int,
-    height: int,
-    batch_size: int,
-    num_images_per_prompt: int,
-    device: torch.device,
-    dtype: torch.dtype,
-    do_classifier_free_guidance: bool = False,
-    guess_mode: bool = False,
-):
-    if not isinstance(image, torch.Tensor):
-        if isinstance(image, PIL.Image.Image):
-            image = [image]
-
-        if isinstance(image[0], PIL.Image.Image):
-            images = []
-
-            for image_ in image:
-                image_ = image_.convert("RGB")
-                image_ = image_.resize(
-                    (width, height), resample=PIL_INTERPOLATION["lanczos"]
-                )
-                image_ = np.array(image_)
-                image_ = image_[None, :]
-                images.append(image_)
-
-            image = images
-
-            image = np.concatenate(image, axis=0)
-            image = np.array(image).astype(np.float32) / 255.0
-            image = image.transpose(0, 3, 1, 2)
-            image = torch.from_numpy(image)
-        elif isinstance(image[0], torch.Tensor):
-            image = torch.cat(image, dim=0)
-
-    image_batch_size = image.shape[0]
-
-    if image_batch_size == 1:
-        repeat_by = batch_size
-    else:
-        # image batch size is the same as prompt batch size
-        repeat_by = num_images_per_prompt
-
-    image = image.repeat_interleave(repeat_by, dim=0)
-
-    image = image.to(device=device, dtype=dtype)
-
-    if do_classifier_free_guidance and not guess_mode:
-        image = torch.cat([image] * 2)
-
-    return image
-
-
 @event_handler()
 def load_resource(e: LoadResourceEvent):
-    global controlnet_model
     (
-        image,
         enabled,
-        preprocessor,
-        controlnet_model_id,
-        control_weight,
-        start_control_step,
-        end_control_step,
-        guess_mode,
+        image,
+        pfg_scale,
+        pfg_path,
+        pfg_num_tokens
     ) = e.pipe.plugin_data[plugin_id]
+    
     if not enabled:
-        if controlnet_model is not None:
-            del controlnet_model
-            torch.cuda.empty_cache()
-            gc.collect()
-            controlnet_model = None
         return
 
     if type(e.pipe).__mode__ != "diffusers":
-        logger.warning("ControlNet plugin is only available in diffusers mode")
-        e.pipe.plugin_data[plugin_id][1] = False
+        logger.warning("PFG plugin is only available in diffusers mode")
+        e.pipe.plugin_data[plugin_id][0] = False
         return
 
-    if preprocessor != "none":
-        image = preprocess_image(image, preprocessor)
+    hidden_state = infer(image)
 
-    opts: ImageGenerationOptions = e.pipe.opts
-    controlnet_model = ControlNetModel.from_pretrained(
-        controlnet_model_id,
-        use_auth_token=config.get("hf_token"),
-        cache_dir=hf_diffusers_cache_dir(),
-        torch_dtype=torch.float16,
-    ).to(e.pipe.device)
-    e.pipe.plugin_data[plugin_id][0] = prepare_image(
-        image,
-        opts.width,
-        opts.height,
-        opts.batch_size,
-        1,
-        e.pipe.device,
-        controlnet_model.dtype,
-        do_classifier_free_guidance=opts.guidance_scale > 1.0,
-        guess_mode=guess_mode,
-    )
-
+    pfg_weight = torch.load(os.path.join(pfg_path))
+    weight = pfg_weight["pfg_linear.weight"].cpu() #大した計算じゃないのでcpuでいいでしょう
+    bias = pfg_weight["pfg_linear.bias"].cpu()
+    pfg_feature = (weight @ pfg_hidden_state + self.bias) * pfg_scale
 
 @event_handler()
 def pre_unet_predict(e: UNetDenoisingEvent):
