@@ -14,7 +14,8 @@ from api.plugin import get_plugin_id
 from modules import config
 from modules.logger import logger
 from modules.plugin_loader import register_plugin_ui
-from modules.shared import hf_diffusers_cache_dir
+
+from dbimutils import smart_imread_pil, smart_24bit, make_square, smart_resize
 
 plugin_id = get_plugin_id()
 
@@ -80,58 +81,33 @@ def load_resource(e: LoadResourceEvent):
     pfg_weight = torch.load(os.path.join(pfg_path))
     weight = pfg_weight["pfg_linear.weight"].cpu() #大した計算じゃないのでcpuでいいでしょう
     bias = pfg_weight["pfg_linear.bias"].cpu()
-    pfg_feature = (weight @ pfg_hidden_state + self.bias) * pfg_scale
+    pfg_feature = (weight @ pfg_hidden_state + bias) * pfg_scale
+    pfg_feature = pfg_feature.reshape(1, pfg_num_tokens, -1)
+    e.pipe.plugin_data[plugin_id][1] = pfg_feature
 
 @event_handler()
 def pre_unet_predict(e: UNetDenoisingEvent):
     (
-        image,
         enabled,
+        pfg_feature,
         _,
         _,
-        control_weight,
-        start_control_step,
-        end_control_step,
-        guess_mode,
+        pfg_num_tokens,
     ) = e.pipe.plugin_data[plugin_id]
-    opts: ImageGenerationOptions = e.pipe.opts
-    if (
-        not enabled
-        or e.step / opts.num_inference_steps < start_control_step
-        or e.step / opts.num_inference_steps > end_control_step
-    ):
+    if enabled or e.step > 0:
         return
+    
+    
+    print(f"Apply pfg")
+    #(batch_size*num_prompts, cond_tokens, dim)
+    uncond, cond = e.prompt_embeds.chunk(2)
+    #(1, num_tokens, dim)
+    pfg_cond = pfg_feature.to(cond.device, dtype = cond.dtype)
+    pfg_cond = pfg_cond.repeat(cond.shape[0],1,1)
+    #concatenate
+    cond = torch.cat([cond,pfg_cond],dim=1)
 
-    if guess_mode and e.do_classifier_free_guidance:
-        # Infer ControlNet only for the conditional batch.
-        controlnet_latent_model_input = e.latents
-        controlnet_prompt_embeds = e.prompt_embeds.chunk(2)[1]
-    else:
-        controlnet_latent_model_input = e.latent_model_input
-        controlnet_prompt_embeds = e.prompt_embeds
-
-    down_block_res_samples, mid_block_res_sample = controlnet_model(
-        controlnet_latent_model_input,
-        e.timestep,
-        encoder_hidden_states=controlnet_prompt_embeds,
-        controlnet_cond=image,
-        conditioning_scale=control_weight,
-        guess_mode=guess_mode,
-        return_dict=False,
-    )
-
-    if guess_mode and e.do_classifier_free_guidance:
-        # Infered ControlNet only for the conditional batch.
-        # To apply the output of ControlNet to both the unconditional and conditional batches,
-        # add 0 to the unconditional batch to keep it unchanged.
-        down_block_res_samples = [
-            torch.cat([torch.zeros_like(d), d]) for d in down_block_res_samples
-        ]
-        mid_block_res_sample = torch.cat(
-            [torch.zeros_like(mid_block_res_sample), mid_block_res_sample]
-        )
-
-    e.unet_additional_kwargs = {
-        "down_block_additional_residuals": down_block_res_samples,
-        "mid_block_additional_residual": mid_block_res_sample,
-    }
+    #copy zero
+    pfg_uncond_zero = torch.zeros(uncond.shape[0],pfg_num_tokens,uncond.shape[2]).to(uncond.device, dtype = uncond.dtype)
+    uncond = torch.cat([uncond,pfg_uncond_zero],dim=1)
+    e.prompt_embeds = torch.cat([uncond, cond])
